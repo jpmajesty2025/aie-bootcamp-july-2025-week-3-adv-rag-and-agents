@@ -259,6 +259,12 @@ class DependencyScanner:
             
             console.print(f"Found {len(supported_files)} files to scan", style="blue")
             
+            # Limit files for large repositories to prevent hanging
+            max_files = 1000
+            if len(supported_files) > max_files:
+                console.print(f"⚠️ Large repository detected. Limiting scan to first {max_files} files", style="yellow")
+                supported_files = supported_files[:max_files]
+            
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -266,12 +272,17 @@ class DependencyScanner:
             ) as progress:
                 task = progress.add_task("Scanning files...", total=len(supported_files))
                 
-                for file_path in supported_files:
+                for i, file_path in enumerate(supported_files):
                     try:
                         # Skip files in common directories to ignore
-                        if any(part in ['.git', '__pycache__', 'node_modules', 'venv', '.venv'] 
+                        if any(part in ['.git', '__pycache__', 'node_modules', 'venv', '.venv', 'dist', 'build'] 
                                for part in file_path.parts):
+                            progress.update(task, advance=1)
                             continue
+                        
+                        # Update progress description with current file
+                        if i % 10 == 0:  # Update every 10 files to avoid spam
+                            progress.update(task, description=f"Scanning {file_path.name}...")
                         
                         # Create file node
                         file_id = self._create_file_node(file_path, repo_id)
@@ -285,8 +296,11 @@ class DependencyScanner:
                         
                         progress.update(task, advance=1)
                         
+                    except KeyboardInterrupt:
+                        console.print(f"\n⚠️ File scanning interrupted by user", style="yellow")
+                        break
                     except Exception as e:
-                        console.print(f"⚠️ Failed to process file {file_path}: {e}", style="yellow")
+                        console.print(f"⚠️ Failed to process file {file_path.name}: {e}", style="yellow")
                         progress.update(task, advance=1)
                         continue
             
@@ -642,86 +656,96 @@ class DependencyScanner:
     def _create_dependency_relationships(self, file_id: str, imports: List[ImportInfo], repo_id: str):
         """Create dependency relationships in Neo4j"""
         try:
-            with self.driver.session() as session:
-                for import_info in imports:
-                    # Create module node
-                    session.run("""
-                        MERGE (m:Module {name: $module_name})
-                        SET m.last_seen = datetime()
-                    """, module_name=import_info.module)
-                    
-                    # Create relationship based on import type
-                    if import_info.import_type == "direct":
-                        session.run("""
-                            MATCH (f:File {path: $file_id})
-                            MATCH (m:Module {name: $module_name})
-                            MERGE (f)-[r:IMPORTS]->(m)
-                            SET r.line = $line,
-                                r.alias = $alias
-                        """, file_id=file_id,
-                             module_name=import_info.module,
-                             line=import_info.line_number,
-                             alias=import_info.alias)
-                    
-                    elif import_info.import_type == "from_import":
-                        session.run("""
-                            MATCH (f:File {path: $file_id})
-                            MATCH (m:Module {name: $module_name})
-                            MERGE (f)-[r:IMPORTS_FROM]->(m)
-                            SET r.line = $line,
-                                r.alias = $alias
-                        """, file_id=file_id,
-                             module_name=import_info.module,
-                             line=import_info.line_number,
-                             alias=import_info.alias)
-                        
-                        # Create specific item relationships if items are specified
-                        if import_info.items:
-                            for item in import_info.items:
-                                # Create function/class node
-                                full_name = f"{import_info.module}.{item}"
-                                session.run("""
-                                    MERGE (func:Function {full_name: $full_name})
-                                    SET func.name = $item_name,
-                                        func.module = $module_name,
-                                        func.type = 'unknown'
-                                """, full_name=full_name,
-                                         item_name=item,
-                                         module_name=import_info.module)
-                                
-                                # Create CONTAINS relationship
-                                session.run("""
-                                    MATCH (m:Module {name: $module_name})
-                                    MATCH (func:Function {full_name: $full_name})
-                                    MERGE (m)-[r:CONTAINS]->(func)
-                                """, module_name=import_info.module,
-                                         full_name=full_name)
-                                
-                                # Create IMPORTS_SPECIFIC relationship
+            # Process imports in smaller batches to avoid session issues
+            batch_size = 10
+            for i in range(0, len(imports), batch_size):
+                batch = imports[i:i + batch_size]
+                
+                with self.driver.session() as session:
+                    for import_info in batch:
+                        try:
+                            # Create module node
+                            session.run("""
+                                MERGE (m:Module {name: $module_name})
+                                SET m.last_seen = datetime()
+                            """, module_name=import_info.module)
+                            
+                            # Create relationship based on import type
+                            if import_info.import_type == "direct":
                                 session.run("""
                                     MATCH (f:File {path: $file_id})
-                                    MATCH (func:Function {full_name: $full_name})
-                                    MERGE (f)-[r:IMPORTS_SPECIFIC]->(func)
+                                    MATCH (m:Module {name: $module_name})
+                                    MERGE (f)-[r:IMPORTS]->(m)
                                     SET r.line = $line,
                                         r.alias = $alias
                                 """, file_id=file_id,
-                                         full_name=full_name,
-                                         line=import_info.line_number,
-                                         alias=import_info.alias)
-                    
-                    else:  # relative imports, namespace imports, etc.
-                        session.run("""
-                            MATCH (f:File {path: $file_id})
-                            MATCH (m:Module {name: $module_name})
-                            MERGE (f)-[r:RELATIVE_IMPORTS]->(m)
-                            SET r.line = $line,
-                                r.alias = $alias,
-                                r.import_type = $import_type
-                        """, file_id=file_id,
-                             module_name=import_info.module,
-                             line=import_info.line_number,
-                             alias=import_info.alias,
-                             import_type=import_info.import_type)
+                                     module_name=import_info.module,
+                                     line=import_info.line_number,
+                                     alias=import_info.alias)
+                            
+                            elif import_info.import_type == "from_import":
+                                session.run("""
+                                    MATCH (f:File {path: $file_id})
+                                    MATCH (m:Module {name: $module_name})
+                                    MERGE (f)-[r:IMPORTS_FROM]->(m)
+                                    SET r.line = $line,
+                                        r.alias = $alias
+                                """, file_id=file_id,
+                                     module_name=import_info.module,
+                                     line=import_info.line_number,
+                                     alias=import_info.alias)
+                                
+                                # Create specific item relationships if items are specified
+                                if import_info.items:
+                                    for item in import_info.items:
+                                        # Create function/class node
+                                        full_name = f"{import_info.module}.{item}"
+                                        session.run("""
+                                            MERGE (func:Function {full_name: $full_name})
+                                            SET func.name = $item_name,
+                                                func.module = $module_name,
+                                                func.type = 'unknown'
+                                        """, full_name=full_name,
+                                                 item_name=item,
+                                                 module_name=import_info.module)
+                                        
+                                        # Create CONTAINS relationship
+                                        session.run("""
+                                            MATCH (m:Module {name: $module_name})
+                                            MATCH (func:Function {full_name: $full_name})
+                                            MERGE (m)-[r:CONTAINS]->(func)
+                                        """, module_name=import_info.module,
+                                                 full_name=full_name)
+                                        
+                                        # Create IMPORTS_SPECIFIC relationship
+                                        session.run("""
+                                            MATCH (f:File {path: $file_id})
+                                            MATCH (func:Function {full_name: $full_name})
+                                            MERGE (f)-[r:IMPORTS_SPECIFIC]->(func)
+                                            SET r.line = $line,
+                                                r.alias = $alias
+                                        """, file_id=file_id,
+                                                 full_name=full_name,
+                                                 line=import_info.line_number,
+                                                 alias=import_info.alias)
+                            
+                            else:  # relative imports, namespace imports, etc.
+                                session.run("""
+                                    MATCH (f:File {path: $file_id})
+                                    MATCH (m:Module {name: $module_name})
+                                    MERGE (f)-[r:RELATIVE_IMPORTS]->(m)
+                                    SET r.line = $line,
+                                        r.alias = $alias,
+                                        r.import_type = $import_type
+                                """, file_id=file_id,
+                                     module_name=import_info.module,
+                                     line=import_info.line_number,
+                                     alias=import_info.alias,
+                                     import_type=import_info.import_type)
+                        
+                        except Exception as e:
+                            console.print(f"⚠️ Failed to process import {import_info.module}: {e}", style="yellow")
+                            continue
                 
         except Exception as e:
             console.print(f"❌ Failed to create dependency relationships: {e}", style="red")
@@ -876,7 +900,7 @@ class DependencyScanner:
         """Build and analyze the dependency graph"""
         try:
             with self.driver.session() as session:
-                # Count nodes and relationships
+                # Count nodes and relationships separately to avoid syntax issues
                 result = session.run("""
                     MATCH (r:Repository {url: $repo_id})
                     OPTIONAL MATCH (r)-[:BELONGS_TO]-(f:File)
@@ -887,17 +911,25 @@ class DependencyScanner:
                     RETURN count(DISTINCT f) as files,
                            count(DISTINCT m) + count(DISTINCT m2) as modules,
                            count(DISTINCT p) as packages,
-                           count(DISTINCT func) as functions,
-                           count(DISTINCT (f)-[:IMPORTS]->(m)) + 
-                           count(DISTINCT (f)-[:IMPORTS_FROM]->(m2)) + 
-                           count(DISTINCT (f)-[:IMPORTS_SPECIFIC]->(func)) as dependencies
+                           count(DISTINCT func) as functions
+                """, repo_id=repo_id)
+                
+                # Count relationships separately
+                rel_result = session.run("""
+                    MATCH (r:Repository {url: $repo_id})
+                    OPTIONAL MATCH (r)-[:BELONGS_TO]-(f:File)
+                    OPTIONAL MATCH (f)-[r1:IMPORTS]->()
+                    OPTIONAL MATCH (f)-[r2:IMPORTS_FROM]->()
+                    OPTIONAL MATCH (f)-[r3:IMPORTS_SPECIFIC]->()
+                    RETURN count(r1) + count(r2) + count(r3) as dependencies
                 """, repo_id=repo_id)
                 
                 stats = result.single()
+                rel_stats = rel_result.single()
                 
                 return {
                     "nodes": stats["files"] + stats["modules"] + stats["packages"] + stats["functions"],
-                    "relationships": stats["dependencies"]
+                    "relationships": rel_stats["dependencies"]
                 }
                 
         except Exception as e:
@@ -920,11 +952,23 @@ class DependencyScanner:
                         RETURN count(DISTINCT f) as files,
                                count(DISTINCT m) + count(DISTINCT m2) as modules,
                                count(DISTINCT p) as packages,
-                               count(DISTINCT func) as functions,
-                               count(DISTINCT (f)-[:IMPORTS]->(m)) + 
-                               count(DISTINCT (f)-[:IMPORTS_FROM]->(m2)) + 
-                               count(DISTINCT (f)-[:IMPORTS_SPECIFIC]->(func)) as dependencies
+                               count(DISTINCT func) as functions
                     """, repo_url=repo_url)
+                    
+                    # Count relationships separately
+                    rel_result = session.run("""
+                        MATCH (r:Repository {url: $repo_url})
+                        OPTIONAL MATCH (r)-[:BELONGS_TO]-(f:File)
+                        OPTIONAL MATCH (f)-[r1:IMPORTS]->()
+                        OPTIONAL MATCH (f)-[r2:IMPORTS_FROM]->()
+                        OPTIONAL MATCH (f)-[r3:IMPORTS_SPECIFIC]->()
+                        RETURN count(r1) + count(r2) + count(r3) as dependencies
+                    """, repo_url=repo_url)
+                    
+                    stats = dict(result.single())
+                    stats["dependencies"] = rel_result.single()["dependencies"]
+                    return stats
+                    
                 else:
                     # Global statistics
                     result = session.run("""
@@ -937,13 +981,21 @@ class DependencyScanner:
                                count(DISTINCT m) + count(DISTINCT m2) as modules,
                                count(DISTINCT p) as packages,
                                count(DISTINCT func) as functions,
-                               count(DISTINCT (f)-[:IMPORTS]->(m)) + 
-                               count(DISTINCT (f)-[:IMPORTS_FROM]->(m2)) + 
-                               count(DISTINCT (f)-[:IMPORTS_SPECIFIC]->(func)) as dependencies,
                                count(DISTINCT r) as repositories
                     """)
-                
-                return dict(result.single())
+                    
+                    # Count relationships separately
+                    rel_result = session.run("""
+                        MATCH (f:File)
+                        OPTIONAL MATCH (f)-[r1:IMPORTS]->()
+                        OPTIONAL MATCH (f)-[r2:IMPORTS_FROM]->()
+                        OPTIONAL MATCH (f)-[r3:IMPORTS_SPECIFIC]->()
+                        RETURN count(r1) + count(r2) + count(r3) as dependencies
+                    """)
+                    
+                    stats = dict(result.single())
+                    stats["dependencies"] = rel_result.single()["dependencies"]
+                    return stats
                 
         except Exception as e:
             console.print(f"❌ Failed to get dependency statistics: {e}", style="red")
@@ -976,23 +1028,24 @@ class DependencyScanner:
 def main():
     """Demo function showing how to use the Dependency Scanner"""
     
-    # Test repositories
+    # Test repositories - start with smaller ones
     test_repos = [
-        r"C:\Projects\requests",
-        r"C:\Projects\openai-python",
-        r"C:\Projects\react",
-        r"C:\Projects\langchain"
+        r"C:\Projects\requests",  # Small Python project
+        r"C:\Projects\openai-python",  # Medium Python project
+        # r"C:\Projects\react",  # Large JS project - commented out for now
+        # r"C:\Projects\langchain"  # Very large Python project - commented out for now
     ]
     
     console.print("=== GitHub Repository Dependency Scanner Demo ===\n", style="bold blue")
+    console.print("💡 Tip: Press Ctrl+C to stop the scan at any time", style="yellow")
     
     try:
         # Initialize scanner
         scanner = DependencyScanner()
         
         # Scan repositories
-        for repo_path in test_repos:
-            console.print(f"\n🔍 Scanning repository: {repo_path}", style="bold")
+        for i, repo_path in enumerate(test_repos, 1):
+            console.print(f"\n🔍 Scanning repository {i}/{len(test_repos)}: {repo_path}", style="bold")
             try:
                 results = scanner.scan_repository(repo_path)
                 console.print(f"✅ Scan completed successfully", style="green")
@@ -1000,8 +1053,12 @@ def main():
                 # Display statistics
                 scanner.display_statistics_table(results["repository"])
                 
+            except KeyboardInterrupt:
+                console.print(f"\n⚠️ Scan interrupted by user", style="yellow")
+                break
             except Exception as e:
                 console.print(f"❌ Failed to scan {repo_path}: {e}", style="red")
+                console.print("Continuing with next repository...", style="yellow")
         
         # Display global statistics
         console.print("\n📊 Global Dependency Graph Statistics:", style="bold")
@@ -1009,6 +1066,12 @@ def main():
         
         scanner.close()
         
+    except KeyboardInterrupt:
+        console.print(f"\n⚠️ Program interrupted by user", style="yellow")
+        try:
+            scanner.close()
+        except:
+            pass
     except Exception as e:
         console.print(f"❌ Demo failed: {e}", style="red")
         console.print("Please check your Neo4j connection and try again.", style="yellow")
