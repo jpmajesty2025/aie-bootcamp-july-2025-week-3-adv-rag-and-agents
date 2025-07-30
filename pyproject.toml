@@ -1,0 +1,7 @@
+[project]
+name = "aie-bootcamp-july-2025-week-3-adv-rag-and-agents"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []

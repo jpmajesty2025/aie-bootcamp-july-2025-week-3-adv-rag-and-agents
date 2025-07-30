@@ -1,0 +1,10 @@
+.DS_Store
+
+.env
+.venv
+.cursorrulesgit
+env.*
+*.json
+*.mp3
+*pycache*
+*.log
