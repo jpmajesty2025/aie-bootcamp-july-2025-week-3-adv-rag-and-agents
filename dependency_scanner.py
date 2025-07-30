@@ -6,24 +6,62 @@ It parses import statements across different file types and stores the dependenc
 graph with nodes representing files/modules and edges representing dependencies.
 
 Required packages:
-pip install neo4j requests gitpython ast pathlib typing-extensions
+pip install neo4j langchain langchain-openai langchain-community pydantic python-dotenv gitpython requests rich
 """
 
 import os
 import ast
 import re
 import json
-import requests
 import git
 from pathlib import Path
 from typing import List, Dict, Set, Optional, Tuple, Any
 from urllib.parse import urlparse
 from datetime import datetime
 import logging
+from dataclasses import dataclass
+
+# Environment and configuration
+from dotenv import load_dotenv
+
+# LangChain imports
+from langchain_core.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_community.graphs import Neo4jGraph
 
 # Neo4j imports
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable, AuthError
+
+# Rich for better console output
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+# Load environment variables
+load_dotenv()
+
+# Setup console for rich output
+console = Console()
+
+
+@dataclass
+class ImportInfo:
+    """Data class for storing import information"""
+    module: str
+    items: List[str] = None
+    import_type: str = "direct"  # direct, from_import, relative
+    line_number: int = 0
+    alias: Optional[str] = None
+
+
+@dataclass
+class DependencyInfo:
+    """Data class for storing dependency information"""
+    name: str
+    version: Optional[str] = None
+    dependency_type: str = "package"  # package, module, function
+    source_file: Optional[str] = None
 
 
 class DependencyScanner:
@@ -32,32 +70,51 @@ class DependencyScanner:
     """
     
     def __init__(self, 
-                 neo4j_uri: str,
-                 neo4j_username: str,
-                 neo4j_password: str,
-                 github_token: Optional[str] = None):
+                 neo4j_uri: Optional[str] = None,
+                 neo4j_username: Optional[str] = None,
+                 neo4j_password: Optional[str] = None,
+                 openai_api_key: Optional[str] = None,
+                 model_name: str = "gpt-4o-mini"):
         """
         Initialize the dependency scanner
         
         Args:
-            neo4j_uri: Neo4j database URI
-            neo4j_username: Neo4j username
-            neo4j_password: Neo4j password
-            github_token: GitHub API token for authenticated requests
+            neo4j_uri: Neo4j database URI (defaults to NEO4J_URI env var)
+            neo4j_username: Neo4j username (defaults to NEO4J_USERNAME env var)
+            neo4j_password: Neo4j password (defaults to NEO4J_PASSWORD env var)
+            openai_api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
+            model_name: OpenAI model name to use
         """
-        self.neo4j_uri = neo4j_uri
-        self.neo4j_username = neo4j_username
-        self.neo4j_password = neo4j_password
-        self.github_token = github_token
+        # Load configuration from environment variables
+        self.neo4j_uri = neo4j_uri or os.getenv("NEO4J_URI")
+        self.neo4j_username = neo4j_username or os.getenv("NEO4J_USERNAME")
+        self.neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD")
+        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        
+        if not all([self.neo4j_uri, self.neo4j_username, self.neo4j_password]):
+            raise ValueError("Missing Neo4j configuration. Please set NEO4J_URI, NEO4J_USERNAME, and NEO4J_PASSWORD environment variables.")
         
         # Initialize Neo4j driver
-        self.driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_username, neo4j_password))
+        self.driver = GraphDatabase.driver(
+            self.neo4j_uri, 
+            auth=(self.neo4j_username, self.neo4j_password)
+        )
+        
+        # Initialize LangChain components
+        if self.openai_api_key:
+            self.llm = ChatOpenAI(temperature=0, model=model_name)
+        else:
+            self.llm = None
+            console.print("⚠️  OpenAI API key not provided. LLM features will be disabled.", style="yellow")
+        
+        # Initialize Neo4j Graph for LangChain integration
+        self.graph_db = Neo4jGraph(enhanced_schema=True)
         
         # Setup logging
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
         
-        # File extensions to scan
+        # File extensions to scan with their parsers
         self.supported_extensions = {
             '.py': self._parse_python_imports,
             '.js': self._parse_javascript_imports,
@@ -71,9 +128,25 @@ class DependencyScanner:
             '.rb': self._parse_ruby_imports
         }
         
+        # Language mapping
+        self.language_map = {
+            '.py': 'Python',
+            '.js': 'JavaScript',
+            '.ts': 'TypeScript',
+            '.jsx': 'JavaScript',
+            '.tsx': 'TypeScript',
+            '.java': 'Java',
+            '.go': 'Go',
+            '.rs': 'Rust',
+            '.php': 'PHP',
+            '.rb': 'Ruby'
+        }
+        
         # Initialize database schema
         self._setup_database_schema()
         
+        console.print("✅ Dependency Scanner initialized successfully", style="green")
+    
     def _setup_database_schema(self):
         """Setup Neo4j database schema with constraints and indexes"""
         try:
@@ -83,54 +156,57 @@ class DependencyScanner:
                 session.run("CREATE CONSTRAINT module_name IF NOT EXISTS FOR (m:Module) REQUIRE m.name IS UNIQUE")
                 session.run("CREATE CONSTRAINT package_name IF NOT EXISTS FOR (p:Package) REQUIRE p.name IS UNIQUE")
                 session.run("CREATE CONSTRAINT repository_url IF NOT EXISTS FOR (r:Repository) REQUIRE r.url IS UNIQUE")
+                session.run("CREATE CONSTRAINT function_name IF NOT EXISTS FOR (f:Function) REQUIRE f.full_name IS UNIQUE")
                 
                 # Create indexes for better query performance
                 session.run("CREATE INDEX file_extension IF NOT EXISTS FOR (f:File) ON (f.extension)")
                 session.run("CREATE INDEX file_language IF NOT EXISTS FOR (f:File) ON (f.language)")
-                session.run("CREATE INDEX dependency_type IF NOT EXISTS FOR ()-[d:DEPENDS_ON]-() ON (d.type)")
+                session.run("CREATE INDEX import_type IF NOT EXISTS FOR ()-[i:IMPORTS]-() ON (i.type)")
+                session.run("CREATE INDEX import_from_type IF NOT EXISTS FOR ()-[i:IMPORTS_FROM]-() ON (i.type)")
                 
-                self.logger.info("✅ Database schema setup completed")
+                console.print("✅ Database schema setup completed", style="green")
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to setup database schema: {e}")
+            console.print(f"❌ Failed to setup database schema: {e}", style="red")
             raise
     
-    def scan_github_repository(self, 
-                              repo_url: str, 
-                              branch: str = "main",
-                              local_path: Optional[str] = None) -> Dict[str, Any]:
+    def scan_repository(self, 
+                       repo_path: str, 
+                       repo_url: Optional[str] = None,
+                       branch: str = "main") -> Dict[str, Any]:
         """
-        Scan a GitHub repository and build its dependency graph
+        Scan a repository and build its dependency graph
         
         Args:
-            repo_url: GitHub repository URL
+            repo_path: Path to the repository (local)
+            repo_url: Optional repository URL for metadata
             branch: Branch to scan (default: main)
-            local_path: Optional local path to clone to
             
         Returns:
             Dictionary with scan results and statistics
         """
         try:
-            self.logger.info(f"🔍 Starting scan of repository: {repo_url}")
+            repo_path_obj = Path(repo_path)
+            if not repo_path_obj.exists():
+                raise ValueError(f"Repository path does not exist: {repo_path}")
             
-            # Clone or update repository
-            repo_path = self._get_repository(repo_url, branch, local_path)
+            console.print(f"🔍 Starting scan of repository: {repo_path}", style="blue")
             
             # Create repository node
-            repo_id = self._create_repository_node(repo_url, repo_path)
+            repo_id = self._create_repository_node(repo_path, repo_url)
             
             # Scan all files in the repository
-            scan_results = self._scan_repository_files(repo_path, repo_id)
+            scan_results = self._scan_repository_files(repo_path_obj, repo_id)
             
             # Parse dependency files
-            dependency_results = self._parse_dependency_files(repo_path, repo_id)
+            dependency_results = self._parse_dependency_files(repo_path_obj, repo_id)
             
             # Build dependency graph
             graph_results = self._build_dependency_graph(repo_id)
             
             # Generate scan summary
             summary = {
-                "repository": repo_url,
+                "repository": repo_url or repo_path,
                 "branch": branch,
                 "scan_timestamp": datetime.now().isoformat(),
                 "files_scanned": scan_results["files_scanned"],
@@ -140,89 +216,78 @@ class DependencyScanner:
                 "graph_relationships": graph_results["relationships"]
             }
             
-            self.logger.info(f"✅ Repository scan completed: {summary}")
+            console.print(f"✅ Repository scan completed: {summary}", style="green")
             return summary
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to scan repository {repo_url}: {e}")
+            console.print(f"❌ Failed to scan repository {repo_path}: {e}", style="red")
             raise
     
-    def _get_repository(self, repo_url: str, branch: str, local_path: Optional[str]) -> str:
-        """Clone or update a GitHub repository"""
-        try:
-            # Parse repository URL
-            parsed_url = urlparse(repo_url)
-            repo_name = parsed_url.path.strip('/').split('/')[-1]
-            
-            # Determine local path
-            if local_path is None:
-                local_path = f"./temp_repos/{repo_name}"
-            
-            repo_path = Path(local_path)
-            repo_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Clone or pull repository
-            if repo_path.exists() and (repo_path / ".git").exists():
-                self.logger.info(f"📥 Updating existing repository at {repo_path}")
-                repo = git.Repo(repo_path)
-                repo.remotes.origin.pull()
-            else:
-                self.logger.info(f"📥 Cloning repository to {repo_path}")
-                repo = git.Repo.clone_from(repo_url, repo_path)
-            
-            # Checkout specified branch
-            repo = git.Repo(repo_path)
-            repo.git.checkout(branch)
-            
-            return str(repo_path)
-            
-        except Exception as e:
-            self.logger.error(f"❌ Failed to get repository: {e}")
-            raise
-    
-    def _create_repository_node(self, repo_url: str, repo_path: str) -> str:
+    def _create_repository_node(self, repo_path: str, repo_url: Optional[str]) -> str:
         """Create a repository node in Neo4j"""
         try:
             with self.driver.session() as session:
+                # Use repo_path as URL if none provided
+                url = repo_url or f"file://{repo_path}"
+                
                 result = session.run("""
                     MERGE (r:Repository {url: $url})
                     SET r.path = $path,
                         r.last_scan = datetime(),
                         r.name = $name
                     RETURN r.url as repo_id
-                """, url=repo_url, path=repo_path, name=Path(repo_path).name)
+                """, url=url, path=repo_path, name=Path(repo_path).name)
                 
                 repo_id = result.single()["repo_id"]
-                self.logger.info(f"✅ Created repository node: {repo_id}")
+                console.print(f"✅ Created repository node: {repo_id}", style="green")
                 return repo_id
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to create repository node: {e}")
+            console.print(f"❌ Failed to create repository node: {e}", style="red")
             raise
     
-    def _scan_repository_files(self, repo_path: str, repo_id: str) -> Dict[str, Any]:
+    def _scan_repository_files(self, repo_path: Path, repo_id: str) -> Dict[str, Any]:
         """Scan all files in the repository for dependencies"""
         try:
-            repo_path_obj = Path(repo_path)
             files_scanned = 0
             dependencies_found = 0
             
-            # Walk through all files in the repository
-            for file_path in repo_path_obj.rglob("*"):
-                if file_path.is_file() and file_path.suffix in self.supported_extensions:
+            # Get all files with supported extensions
+            supported_files = []
+            for ext in self.supported_extensions.keys():
+                supported_files.extend(repo_path.rglob(f"*{ext}"))
+            
+            console.print(f"Found {len(supported_files)} files to scan", style="blue")
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console
+            ) as progress:
+                task = progress.add_task("Scanning files...", total=len(supported_files))
+                
+                for file_path in supported_files:
                     try:
+                        # Skip files in common directories to ignore
+                        if any(part in ['.git', '__pycache__', 'node_modules', 'venv', '.venv'] 
+                               for part in file_path.parts):
+                            continue
+                        
                         # Create file node
                         file_id = self._create_file_node(file_path, repo_id)
                         files_scanned += 1
                         
                         # Parse dependencies
-                        dependencies = self._parse_file_dependencies(file_path)
-                        if dependencies:
-                            self._create_dependency_relationships(file_id, dependencies, repo_id)
-                            dependencies_found += len(dependencies)
-                            
+                        imports = self._parse_file_dependencies(file_path)
+                        if imports:
+                            self._create_dependency_relationships(file_id, imports, repo_id)
+                            dependencies_found += len(imports)
+                        
+                        progress.update(task, advance=1)
+                        
                     except Exception as e:
-                        self.logger.warning(f"⚠️ Failed to process file {file_path}: {e}")
+                        console.print(f"⚠️ Failed to process file {file_path}: {e}", style="yellow")
+                        progress.update(task, advance=1)
                         continue
             
             return {
@@ -231,7 +296,7 @@ class DependencyScanner:
             }
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to scan repository files: {e}")
+            console.print(f"❌ Failed to scan repository files: {e}", style="red")
             raise
     
     def _create_file_node(self, file_path: Path, repo_id: str) -> str:
@@ -239,8 +304,7 @@ class DependencyScanner:
         try:
             with self.driver.session() as session:
                 # Get relative path from repository root
-                repo_path = Path(repo_path).parent
-                relative_path = str(file_path.relative_to(repo_path))
+                relative_path = str(file_path.relative_to(file_path.parts[0]))
                 
                 result = session.run("""
                     MERGE (f:File {path: $path})
@@ -254,7 +318,7 @@ class DependencyScanner:
                     RETURN f.path as file_id
                 """, path=relative_path, 
                      extension=file_path.suffix,
-                     language=self._get_language(file_path.suffix),
+                     language=self.language_map.get(file_path.suffix, 'Unknown'),
                      size=file_path.stat().st_size,
                      repo_id=repo_id)
                 
@@ -262,26 +326,10 @@ class DependencyScanner:
                 return file_id
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to create file node: {e}")
+            console.print(f"❌ Failed to create file node: {e}", style="red")
             raise
     
-    def _get_language(self, extension: str) -> str:
-        """Get programming language from file extension"""
-        language_map = {
-            '.py': 'Python',
-            '.js': 'JavaScript',
-            '.ts': 'TypeScript',
-            '.jsx': 'JavaScript',
-            '.tsx': 'TypeScript',
-            '.java': 'Java',
-            '.go': 'Go',
-            '.rs': 'Rust',
-            '.php': 'PHP',
-            '.rb': 'Ruby'
-        }
-        return language_map.get(extension, 'Unknown')
-    
-    def _parse_file_dependencies(self, file_path: Path) -> List[Dict[str, str]]:
+    def _parse_file_dependencies(self, file_path: Path) -> List[ImportInfo]:
         """Parse dependencies from a single file"""
         try:
             extension = file_path.suffix
@@ -294,17 +342,17 @@ class DependencyScanner:
             
             # Parse dependencies based on file type
             parser_func = self.supported_extensions[extension]
-            dependencies = parser_func(content, str(file_path))
+            imports = parser_func(content, str(file_path))
             
-            return dependencies
+            return imports
             
         except Exception as e:
-            self.logger.warning(f"⚠️ Failed to parse dependencies from {file_path}: {e}")
+            console.print(f"⚠️ Failed to parse dependencies from {file_path}: {e}", style="yellow")
             return []
     
-    def _parse_python_imports(self, content: str, file_path: str) -> List[Dict[str, str]]:
+    def _parse_python_imports(self, content: str, file_path: str) -> List[ImportInfo]:
         """Parse Python import statements"""
-        dependencies = []
+        imports = []
         
         try:
             tree = ast.parse(content)
@@ -312,33 +360,45 @@ class DependencyScanner:
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     for alias in node.names:
-                        dependencies.append({
-                            "type": "direct_import",
-                            "module": alias.name,
-                            "alias": alias.asname,
-                            "line": node.lineno
-                        })
+                        imports.append(ImportInfo(
+                            module=alias.name,
+                            import_type="direct",
+                            line_number=node.lineno,
+                            alias=alias.asname
+                        ))
                         
                 elif isinstance(node, ast.ImportFrom):
                     module = node.module or ""
+                    items = []
                     for alias in node.names:
-                        dependencies.append({
-                            "type": "from_import",
-                            "module": module,
-                            "name": alias.name,
-                            "alias": alias.asname,
-                            "line": node.lineno
-                        })
+                        items.append(alias.name)
+                        if alias.asname:
+                            # Handle aliased imports
+                            imports.append(ImportInfo(
+                                module=module,
+                                items=[alias.name],
+                                import_type="from_import",
+                                line_number=node.lineno,
+                                alias=alias.asname
+                            ))
+                    
+                    if items:
+                        imports.append(ImportInfo(
+                            module=module,
+                            items=items,
+                            import_type="from_import",
+                            line_number=node.lineno
+                        ))
                         
         except SyntaxError:
             # Handle syntax errors by using regex fallback
-            dependencies.extend(self._parse_python_imports_regex(content))
+            imports.extend(self._parse_python_imports_regex(content))
         
-        return dependencies
+        return imports
     
-    def _parse_python_imports_regex(self, content: str) -> List[Dict[str, str]]:
+    def _parse_python_imports_regex(self, content: str) -> List[ImportInfo]:
         """Fallback regex parser for Python imports"""
-        dependencies = []
+        imports = []
         
         # Match import statements
         import_pattern = r'^import\s+([a-zA-Z_][a-zA-Z0-9_.]*)(?:\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*))?'
@@ -352,40 +412,40 @@ class DependencyScanner:
             if import_match:
                 module = import_match.group(1)
                 alias = import_match.group(2)
-                dependencies.append({
-                    "type": "direct_import",
-                    "module": module,
-                    "alias": alias,
-                    "line": line_num
-                })
+                imports.append(ImportInfo(
+                    module=module,
+                    import_type="direct",
+                    line_number=line_num,
+                    alias=alias
+                ))
             
             # Check from import statements
             from_match = re.match(from_pattern, line)
             if from_match:
                 module = from_match.group(1)
-                imports = from_match.group(2)
+                imports_text = from_match.group(2)
                 
                 # Parse multiple imports
-                for import_item in imports.split(','):
+                for import_item in imports_text.split(','):
                     import_item = import_item.strip()
                     if ' as ' in import_item:
                         name, alias = import_item.split(' as ', 1)
                     else:
                         name, alias = import_item, None
                     
-                    dependencies.append({
-                        "type": "from_import",
-                        "module": module,
-                        "name": name,
-                        "alias": alias,
-                        "line": line_num
-                    })
+                    imports.append(ImportInfo(
+                        module=module,
+                        items=[name],
+                        import_type="from_import",
+                        line_number=line_num,
+                        alias=alias
+                    ))
         
-        return dependencies
+        return imports
     
-    def _parse_javascript_imports(self, content: str, file_path: str) -> List[Dict[str, str]]:
+    def _parse_javascript_imports(self, content: str, file_path: str) -> List[ImportInfo]:
         """Parse JavaScript/JSX import statements"""
-        dependencies = []
+        imports = []
         
         # Match ES6 import statements
         import_patterns = [
@@ -403,52 +463,52 @@ class DependencyScanner:
                 for match in matches:
                     if isinstance(match, tuple):
                         if len(match) == 2:
-                            imports, module = match
-                            if imports.startswith('{') and imports.endswith('}'):
+                            imports_part, module = match
+                            if imports_part.startswith('{') and imports_part.endswith('}'):
                                 # Named imports
-                                named_imports = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*))?', imports)
+                                named_imports = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*))?', imports_part)
                                 for name, alias in named_imports:
-                                    dependencies.append({
-                                        "type": "named_import",
-                                        "module": module,
-                                        "name": name,
-                                        "alias": alias,
-                                        "line": line_num
-                                    })
+                                    imports.append(ImportInfo(
+                                        module=module,
+                                        items=[name],
+                                        import_type="from_import",
+                                        line_number=line_num,
+                                        alias=alias
+                                    ))
                             else:
                                 # Default import
-                                dependencies.append({
-                                    "type": "default_import",
-                                    "module": module,
-                                    "name": imports,
-                                    "line": line_num
-                                })
+                                imports.append(ImportInfo(
+                                    module=module,
+                                    items=[imports_part],
+                                    import_type="from_import",
+                                    line_number=line_num
+                                ))
                         else:
                             # Namespace import
                             namespace, module = match
-                            dependencies.append({
-                                "type": "namespace_import",
-                                "module": module,
-                                "namespace": namespace,
-                                "line": line_num
-                            })
+                            imports.append(ImportInfo(
+                                module=module,
+                                items=[namespace],
+                                import_type="namespace_import",
+                                line_number=line_num
+                            ))
                     else:
                         # Simple import
-                        dependencies.append({
-                            "type": "simple_import",
-                            "module": match,
-                            "line": line_num
-                        })
+                        imports.append(ImportInfo(
+                            module=match,
+                            import_type="direct",
+                            line_number=line_num
+                        ))
         
-        return dependencies
+        return imports
     
-    def _parse_typescript_imports(self, content: str, file_path: str) -> List[Dict[str, str]]:
+    def _parse_typescript_imports(self, content: str, file_path: str) -> List[ImportInfo]:
         """Parse TypeScript imports (same as JavaScript for now)"""
         return self._parse_javascript_imports(content, file_path)
     
-    def _parse_java_imports(self, content: str, file_path: str) -> List[Dict[str, str]]:
+    def _parse_java_imports(self, content: str, file_path: str) -> List[ImportInfo]:
         """Parse Java import statements"""
-        dependencies = []
+        imports = []
         
         import_pattern = r'^import\s+([a-zA-Z_][a-zA-Z0-9_.]*)(?:\s*;)?'
         
@@ -458,17 +518,17 @@ class DependencyScanner:
             match = re.match(import_pattern, line)
             if match:
                 module = match.group(1)
-                dependencies.append({
-                    "type": "java_import",
-                    "module": module,
-                    "line": line_num
-                })
+                imports.append(ImportInfo(
+                    module=module,
+                    import_type="direct",
+                    line_number=line_num
+                ))
         
-        return dependencies
+        return imports
     
-    def _parse_go_imports(self, content: str, file_path: str) -> List[Dict[str, str]]:
+    def _parse_go_imports(self, content: str, file_path: str) -> List[ImportInfo]:
         """Parse Go import statements"""
-        dependencies = []
+        imports = []
         
         # Match Go import blocks
         import_block_pattern = r'import\s*\(\s*([^)]+)\s*\)'
@@ -484,11 +544,11 @@ class DependencyScanner:
                     match = re.search(r'[\'"]([^\'"]+)[\'"]', line)
                     if match:
                         package = match.group(1)
-                        dependencies.append({
-                            "type": "go_import",
-                            "module": package,
-                            "line": 0  # Line number not available for blocks
-                        })
+                        imports.append(ImportInfo(
+                            module=package,
+                            import_type="direct",
+                            line_number=0  # Line number not available for blocks
+                        ))
         
         # Check for single imports
         for line_num, line in enumerate(content.split('\n'), 1):
@@ -496,17 +556,17 @@ class DependencyScanner:
             match = re.match(single_import_pattern, line)
             if match:
                 package = match.group(1)
-                dependencies.append({
-                    "type": "go_import",
-                    "module": package,
-                    "line": line_num
-                })
+                imports.append(ImportInfo(
+                    module=package,
+                    import_type="direct",
+                    line_number=line_num
+                ))
         
-        return dependencies
+        return imports
     
-    def _parse_rust_imports(self, content: str, file_path: str) -> List[Dict[str, str]]:
+    def _parse_rust_imports(self, content: str, file_path: str) -> List[ImportInfo]:
         """Parse Rust use statements"""
-        dependencies = []
+        imports = []
         
         use_patterns = [
             r'^use\s+([a-zA-Z_][a-zA-Z0-9_:]*)(?:\s*;)?',
@@ -521,25 +581,25 @@ class DependencyScanner:
                 if match:
                     if len(match.groups()) == 1:
                         module = match.group(1)
-                        dependencies.append({
-                            "type": "rust_use",
-                            "module": module,
-                            "line": line_num
-                        })
+                        imports.append(ImportInfo(
+                            module=module,
+                            import_type="direct",
+                            line_number=line_num
+                        ))
                     else:
                         module, item = match.groups()
-                        dependencies.append({
-                            "type": "rust_use_item",
-                            "module": module,
-                            "item": item,
-                            "line": line_num
-                        })
+                        imports.append(ImportInfo(
+                            module=module,
+                            items=[item],
+                            import_type="from_import",
+                            line_number=line_num
+                        ))
         
-        return dependencies
+        return imports
     
-    def _parse_php_imports(self, content: str, file_path: str) -> List[Dict[str, str]]:
+    def _parse_php_imports(self, content: str, file_path: str) -> List[ImportInfo]:
         """Parse PHP use statements"""
-        dependencies = []
+        imports = []
         
         use_pattern = r'^use\s+([a-zA-Z_][a-zA-Z0-9_\\]*)(?:\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*))?(?:\s*;)?'
         
@@ -550,18 +610,18 @@ class DependencyScanner:
             if match:
                 namespace = match.group(1)
                 alias = match.group(2)
-                dependencies.append({
-                    "type": "php_use",
-                    "module": namespace,
-                    "alias": alias,
-                    "line": line_num
-                })
+                imports.append(ImportInfo(
+                    module=namespace,
+                    import_type="direct",
+                    line_number=line_num,
+                    alias=alias
+                ))
         
-        return dependencies
+        return imports
     
-    def _parse_ruby_imports(self, content: str, file_path: str) -> List[Dict[str, str]]:
+    def _parse_ruby_imports(self, content: str, file_path: str) -> List[ImportInfo]:
         """Parse Ruby require/load statements"""
-        dependencies = []
+        imports = []
         
         require_pattern = r'^(?:require|load)\s+[\'"]([^\'"]+)[\'"]'
         
@@ -571,74 +631,129 @@ class DependencyScanner:
             match = re.match(require_pattern, line)
             if match:
                 module = match.group(1)
-                dependencies.append({
-                    "type": "ruby_require",
-                    "module": module,
-                    "line": line_num
-                })
+                imports.append(ImportInfo(
+                    module=module,
+                    import_type="direct",
+                    line_number=line_num
+                ))
         
-        return dependencies
+        return imports
     
-    def _create_dependency_relationships(self, file_id: str, dependencies: List[Dict[str, str]], repo_id: str):
+    def _create_dependency_relationships(self, file_id: str, imports: List[ImportInfo], repo_id: str):
         """Create dependency relationships in Neo4j"""
         try:
             with self.driver.session() as session:
-                for dep in dependencies:
+                for import_info in imports:
                     # Create module node
                     session.run("""
                         MERGE (m:Module {name: $module_name})
-                        SET m.type = $dep_type,
-                            m.last_seen = datetime()
-                    """, module_name=dep["module"], dep_type=dep["type"])
+                        SET m.last_seen = datetime()
+                    """, module_name=import_info.module)
                     
-                    # Create dependency relationship
-                    session.run("""
-                        MATCH (f:File {path: $file_id})
-                        MATCH (m:Module {name: $module_name})
-                        MERGE (f)-[r:DEPENDS_ON]->(m)
-                        SET r.type = $dep_type,
-                            r.line = $line,
-                            r.alias = $alias,
-                            r.name = $name
-                    """, file_id=file_id,
-                         module_name=dep["module"],
-                         dep_type=dep["type"],
-                         line=dep.get("line", 0),
-                         alias=dep.get("alias"),
-                         name=dep.get("name"))
+                    # Create relationship based on import type
+                    if import_info.import_type == "direct":
+                        session.run("""
+                            MATCH (f:File {path: $file_id})
+                            MATCH (m:Module {name: $module_name})
+                            MERGE (f)-[r:IMPORTS]->(m)
+                            SET r.line = $line,
+                                r.alias = $alias
+                        """, file_id=file_id,
+                             module_name=import_info.module,
+                             line=import_info.line_number,
+                             alias=import_info.alias)
+                    
+                    elif import_info.import_type == "from_import":
+                        session.run("""
+                            MATCH (f:File {path: $file_id})
+                            MATCH (m:Module {name: $module_name})
+                            MERGE (f)-[r:IMPORTS_FROM]->(m)
+                            SET r.line = $line,
+                                r.alias = $alias
+                        """, file_id=file_id,
+                             module_name=import_info.module,
+                             line=import_info.line_number,
+                             alias=import_info.alias)
+                        
+                        # Create specific item relationships if items are specified
+                        if import_info.items:
+                            for item in import_info.items:
+                                # Create function/class node
+                                full_name = f"{import_info.module}.{item}"
+                                session.run("""
+                                    MERGE (func:Function {full_name: $full_name})
+                                    SET func.name = $item_name,
+                                        func.module = $module_name,
+                                        func.type = 'unknown'
+                                """, full_name=full_name,
+                                         item_name=item,
+                                         module_name=import_info.module)
+                                
+                                # Create CONTAINS relationship
+                                session.run("""
+                                    MATCH (m:Module {name: $module_name})
+                                    MATCH (func:Function {full_name: $full_name})
+                                    MERGE (m)-[r:CONTAINS]->(func)
+                                """, module_name=import_info.module,
+                                         full_name=full_name)
+                                
+                                # Create IMPORTS_SPECIFIC relationship
+                                session.run("""
+                                    MATCH (f:File {path: $file_id})
+                                    MATCH (func:Function {full_name: $full_name})
+                                    MERGE (f)-[r:IMPORTS_SPECIFIC]->(func)
+                                    SET r.line = $line,
+                                        r.alias = $alias
+                                """, file_id=file_id,
+                                         full_name=full_name,
+                                         line=import_info.line_number,
+                                         alias=import_info.alias)
+                    
+                    else:  # relative imports, namespace imports, etc.
+                        session.run("""
+                            MATCH (f:File {path: $file_id})
+                            MATCH (m:Module {name: $module_name})
+                            MERGE (f)-[r:RELATIVE_IMPORTS]->(m)
+                            SET r.line = $line,
+                                r.alias = $alias,
+                                r.import_type = $import_type
+                        """, file_id=file_id,
+                             module_name=import_info.module,
+                             line=import_info.line_number,
+                             alias=import_info.alias,
+                             import_type=import_info.import_type)
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to create dependency relationships: {e}")
+            console.print(f"❌ Failed to create dependency relationships: {e}", style="red")
             raise
     
-    def _parse_dependency_files(self, repo_path: str, repo_id: str) -> Dict[str, Any]:
+    def _parse_dependency_files(self, repo_path: Path, repo_id: str) -> Dict[str, Any]:
         """Parse external dependency files (requirements.txt, package.json, etc.)"""
         try:
-            repo_path_obj = Path(repo_path)
             external_packages = []
             
             # Python requirements
-            requirements_files = list(repo_path_obj.glob("**/requirements*.txt"))
+            requirements_files = list(repo_path.glob("**/requirements*.txt"))
             for req_file in requirements_files:
                 packages = self._parse_requirements_file(req_file)
                 for package in packages:
-                    package["source_file"] = str(req_file.relative_to(repo_path_obj))
+                    package["source_file"] = str(req_file.relative_to(repo_path))
                     external_packages.append(package)
             
             # Node.js package.json
-            package_json_files = list(repo_path_obj.glob("**/package.json"))
+            package_json_files = list(repo_path.glob("**/package.json"))
             for pkg_file in package_json_files:
                 packages = self._parse_package_json(pkg_file)
                 for package in packages:
-                    package["source_file"] = str(pkg_file.relative_to(repo_path_obj))
+                    package["source_file"] = str(pkg_file.relative_to(repo_path))
                     external_packages.append(package)
             
             # Go go.mod
-            go_mod_files = list(repo_path_obj.glob("**/go.mod"))
+            go_mod_files = list(repo_path.glob("**/go.mod"))
             for go_mod in go_mod_files:
                 packages = self._parse_go_mod(go_mod)
                 for package in packages:
-                    package["source_file"] = str(go_mod.relative_to(repo_path_obj))
+                    package["source_file"] = str(go_mod.relative_to(repo_path))
                     external_packages.append(package)
             
             # Create package nodes and relationships
@@ -647,7 +762,7 @@ class DependencyScanner:
             return {"external_packages": len(external_packages)}
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to parse dependency files: {e}")
+            console.print(f"❌ Failed to parse dependency files: {e}", style="red")
             raise
     
     def _parse_requirements_file(self, file_path: Path) -> List[Dict[str, str]]:
@@ -677,7 +792,7 @@ class DependencyScanner:
                             "type": "python_package"
                         })
         except Exception as e:
-            self.logger.warning(f"⚠️ Failed to parse requirements file {file_path}: {e}")
+            console.print(f"⚠️ Failed to parse requirements file {file_path}: {e}", style="yellow")
         
         return packages
     
@@ -699,7 +814,7 @@ class DependencyScanner:
                                 "type": f"npm_{dep_type.replace('Dependencies', '')}"
                             })
         except Exception as e:
-            self.logger.warning(f"⚠️ Failed to parse package.json {file_path}: {e}")
+            console.print(f"⚠️ Failed to parse package.json {file_path}: {e}", style="yellow")
         
         return packages
     
@@ -723,7 +838,7 @@ class DependencyScanner:
                                 "type": "go_module"
                             })
         except Exception as e:
-            self.logger.warning(f"⚠️ Failed to parse go.mod {file_path}: {e}")
+            console.print(f"⚠️ Failed to parse go.mod {file_path}: {e}", style="yellow")
         
         return packages
     
@@ -754,7 +869,7 @@ class DependencyScanner:
                          source_file=package.get("source_file"))
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to create package relationships: {e}")
+            console.print(f"❌ Failed to create package relationships: {e}", style="red")
             raise
     
     def _build_dependency_graph(self, repo_id: str) -> Dict[str, int]:
@@ -765,23 +880,28 @@ class DependencyScanner:
                 result = session.run("""
                     MATCH (r:Repository {url: $repo_id})
                     OPTIONAL MATCH (r)-[:BELONGS_TO]-(f:File)
-                    OPTIONAL MATCH (f)-[:DEPENDS_ON]->(m:Module)
+                    OPTIONAL MATCH (f)-[:IMPORTS]->(m:Module)
+                    OPTIONAL MATCH (f)-[:IMPORTS_FROM]->(m2:Module)
+                    OPTIONAL MATCH (f)-[:IMPORTS_SPECIFIC]->(func:Function)
                     OPTIONAL MATCH (r)-[:USES_PACKAGE]->(p:Package)
                     RETURN count(DISTINCT f) as files,
-                           count(DISTINCT m) as modules,
+                           count(DISTINCT m) + count(DISTINCT m2) as modules,
                            count(DISTINCT p) as packages,
-                           count(DISTINCT (f)-[:DEPENDS_ON]->(m)) as dependencies
+                           count(DISTINCT func) as functions,
+                           count(DISTINCT (f)-[:IMPORTS]->(m)) + 
+                           count(DISTINCT (f)-[:IMPORTS_FROM]->(m2)) + 
+                           count(DISTINCT (f)-[:IMPORTS_SPECIFIC]->(func)) as dependencies
                 """, repo_id=repo_id)
                 
                 stats = result.single()
                 
                 return {
-                    "nodes": stats["files"] + stats["modules"] + stats["packages"],
+                    "nodes": stats["files"] + stats["modules"] + stats["packages"] + stats["functions"],
                     "relationships": stats["dependencies"]
                 }
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to build dependency graph: {e}")
+            console.print(f"❌ Failed to build dependency graph: {e}", style="red")
             raise
     
     def get_dependency_statistics(self, repo_url: Optional[str] = None) -> Dict[str, Any]:
@@ -793,85 +913,105 @@ class DependencyScanner:
                     result = session.run("""
                         MATCH (r:Repository {url: $repo_url})
                         OPTIONAL MATCH (r)-[:BELONGS_TO]-(f:File)
-                        OPTIONAL MATCH (f)-[:DEPENDS_ON]->(m:Module)
+                        OPTIONAL MATCH (f)-[:IMPORTS]->(m:Module)
+                        OPTIONAL MATCH (f)-[:IMPORTS_FROM]->(m2:Module)
+                        OPTIONAL MATCH (f)-[:IMPORTS_SPECIFIC]->(func:Function)
                         OPTIONAL MATCH (r)-[:USES_PACKAGE]->(p:Package)
                         RETURN count(DISTINCT f) as files,
-                               count(DISTINCT m) as modules,
+                               count(DISTINCT m) + count(DISTINCT m2) as modules,
                                count(DISTINCT p) as packages,
-                               count(DISTINCT (f)-[:DEPENDS_ON]->(m)) as dependencies
+                               count(DISTINCT func) as functions,
+                               count(DISTINCT (f)-[:IMPORTS]->(m)) + 
+                               count(DISTINCT (f)-[:IMPORTS_FROM]->(m2)) + 
+                               count(DISTINCT (f)-[:IMPORTS_SPECIFIC]->(func)) as dependencies
                     """, repo_url=repo_url)
                 else:
                     # Global statistics
                     result = session.run("""
                         MATCH (f:File)
-                        OPTIONAL MATCH (f)-[:DEPENDS_ON]->(m:Module)
+                        OPTIONAL MATCH (f)-[:IMPORTS]->(m:Module)
+                        OPTIONAL MATCH (f)-[:IMPORTS_FROM]->(m2:Module)
+                        OPTIONAL MATCH (f)-[:IMPORTS_SPECIFIC]->(func:Function)
                         OPTIONAL MATCH (r:Repository)-[:USES_PACKAGE]->(p:Package)
                         RETURN count(DISTINCT f) as files,
-                               count(DISTINCT m) as modules,
+                               count(DISTINCT m) + count(DISTINCT m2) as modules,
                                count(DISTINCT p) as packages,
-                               count(DISTINCT (f)-[:DEPENDS_ON]->(m)) as dependencies,
+                               count(DISTINCT func) as functions,
+                               count(DISTINCT (f)-[:IMPORTS]->(m)) + 
+                               count(DISTINCT (f)-[:IMPORTS_FROM]->(m2)) + 
+                               count(DISTINCT (f)-[:IMPORTS_SPECIFIC]->(func)) as dependencies,
                                count(DISTINCT r) as repositories
                     """)
                 
                 return dict(result.single())
                 
         except Exception as e:
-            self.logger.error(f"❌ Failed to get dependency statistics: {e}")
+            console.print(f"❌ Failed to get dependency statistics: {e}", style="red")
             raise
+    
+    def display_statistics_table(self, repo_url: Optional[str] = None):
+        """Display dependency statistics in a nice table format"""
+        try:
+            stats = self.get_dependency_statistics(repo_url)
+            
+            table = Table(title="Dependency Graph Statistics")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Count", style="magenta")
+            
+            for key, value in stats.items():
+                table.add_row(key.replace('_', ' ').title(), str(value))
+            
+            console.print(table)
+            
+        except Exception as e:
+            console.print(f"❌ Failed to display statistics: {e}", style="red")
     
     def close(self):
         """Close the Neo4j driver connection"""
         if self.driver:
             self.driver.close()
+            console.print("✅ Neo4j connection closed", style="green")
 
 
 def main():
     """Demo function showing how to use the Dependency Scanner"""
     
-    # Configuration
-    NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
-    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
-    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # Optional
-    
-    # Sample repositories to scan
-    sample_repos = [
-        "https://github.com/langchain-ai/langchain",
-        "https://github.com/openai/openai-python",
-        "https://github.com/neo4j/neo4j-python-driver"
+    # Test repositories
+    test_repos = [
+        r"C:\Projects\requests",
+        r"C:\Projects\openai-python",
+        r"C:\Projects\react",
+        r"C:\Projects\langchain"
     ]
     
-    print("=== GitHub Repository Dependency Scanner Demo ===\n")
+    console.print("=== GitHub Repository Dependency Scanner Demo ===\n", style="bold blue")
     
     try:
         # Initialize scanner
-        scanner = DependencyScanner(
-            neo4j_uri=NEO4J_URI,
-            neo4j_username=NEO4J_USERNAME,
-            neo4j_password=NEO4J_PASSWORD,
-            github_token=GITHUB_TOKEN
-        )
+        scanner = DependencyScanner()
         
         # Scan repositories
-        for repo_url in sample_repos:
-            print(f"\n🔍 Scanning repository: {repo_url}")
+        for repo_path in test_repos:
+            console.print(f"\n🔍 Scanning repository: {repo_path}", style="bold")
             try:
-                results = scanner.scan_github_repository(repo_url)
-                print(f"✅ Scan completed: {results}")
+                results = scanner.scan_repository(repo_path)
+                console.print(f"✅ Scan completed successfully", style="green")
+                
+                # Display statistics
+                scanner.display_statistics_table(results["repository"])
+                
             except Exception as e:
-                print(f"❌ Failed to scan {repo_url}: {e}")
+                console.print(f"❌ Failed to scan {repo_path}: {e}", style="red")
         
-        # Get statistics
-        print("\n📊 Dependency Graph Statistics:")
-        stats = scanner.get_dependency_statistics()
-        for key, value in stats.items():
-            print(f"   {key}: {value}")
+        # Display global statistics
+        console.print("\n📊 Global Dependency Graph Statistics:", style="bold")
+        scanner.display_statistics_table()
         
         scanner.close()
         
     except Exception as e:
-        print(f"❌ Demo failed: {e}")
-        print("Please check your Neo4j connection and try again.")
+        console.print(f"❌ Demo failed: {e}", style="red")
+        console.print("Please check your Neo4j connection and try again.", style="yellow")
 
 
 if __name__ == "__main__":
