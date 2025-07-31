@@ -50,9 +50,11 @@ class ImportInfo:
     """Data class for storing import information"""
     module: str
     items: List[str] = None
-    import_type: str = "direct"  # direct, from_import, relative
+    import_type: str = "direct"  # direct, from_import, relative, wildcard_import, wildcard_resolved, dynamic_import, exec_import
     line_number: int = 0
     alias: Optional[str] = None
+    wildcard_import: bool = False
+    dynamic_import: bool = False
 
 
 @dataclass
@@ -163,6 +165,9 @@ class DependencyScanner:
                 session.run("CREATE INDEX file_language IF NOT EXISTS FOR (f:File) ON (f.language)")
                 session.run("CREATE INDEX import_type IF NOT EXISTS FOR ()-[i:IMPORTS]-() ON (i.type)")
                 session.run("CREATE INDEX import_from_type IF NOT EXISTS FOR ()-[i:IMPORTS_FROM]-() ON (i.type)")
+                session.run("CREATE INDEX wildcard_imports IF NOT EXISTS FOR ()-[w:WILDCARD_IMPORTS]-() ON (w.wildcard_import)")
+                session.run("CREATE INDEX dynamic_imports IF NOT EXISTS FOR ()-[d:DYNAMIC_IMPORTS]-() ON (d.dynamic_import)")
+                session.run("CREATE INDEX transitive_deps IF NOT EXISTS FOR ()-[t:TRANSITIVE_DEPENDS_ON]-() ON (t.added_at)")
                 
                 console.print("✅ Database schema setup completed", style="green")
                 
@@ -365,7 +370,7 @@ class DependencyScanner:
             return []
     
     def _parse_python_imports(self, content: str, file_path: str) -> List[ImportInfo]:
-        """Parse Python import statements"""
+        """Parse Python import statements with enhanced support for complex imports"""
         imports = []
         
         try:
@@ -383,26 +388,53 @@ class DependencyScanner:
                         
                 elif isinstance(node, ast.ImportFrom):
                     module = node.module or ""
-                    items = []
-                    for alias in node.names:
-                        items.append(alias.name)
-                        if alias.asname:
-                            # Handle aliased imports
-                            imports.append(ImportInfo(
-                                module=module,
-                                items=[alias.name],
-                                import_type="from_import",
-                                line_number=node.lineno,
-                                alias=alias.asname
-                            ))
                     
-                    if items:
+                    # Check for wildcard imports
+                    if any(alias.name == "*" for alias in node.names):
                         imports.append(ImportInfo(
                             module=module,
-                            items=items,
-                            import_type="from_import",
-                            line_number=node.lineno
+                            import_type="wildcard_import",
+                            line_number=node.lineno,
+                            wildcard_import=True
                         ))
+                        
+                        # Try to resolve wildcard imports to specific symbols
+                        wildcard_symbols = self._resolve_wildcard_imports(module)
+                        if wildcard_symbols:
+                            for symbol in wildcard_symbols:
+                                imports.append(ImportInfo(
+                                    module=module,
+                                    items=[symbol],
+                                    import_type="wildcard_resolved",
+                                    line_number=node.lineno
+                                ))
+                    
+                    else:
+                        # Regular from imports
+                        items = []
+                        for alias in node.names:
+                            items.append(alias.name)
+                            if alias.asname:
+                                # Handle aliased imports
+                                imports.append(ImportInfo(
+                                    module=module,
+                                    items=[alias.name],
+                                    import_type="from_import",
+                                    line_number=node.lineno,
+                                    alias=alias.asname
+                                ))
+                        
+                        if items:
+                            imports.append(ImportInfo(
+                                module=module,
+                                items=items,
+                                import_type="from_import",
+                                line_number=node.lineno
+                            ))
+            
+            # Detect dynamic imports
+            dynamic_imports = self._detect_dynamic_imports(content)
+            imports.extend(dynamic_imports)
                         
         except SyntaxError:
             # Handle syntax errors by using regex fallback
@@ -653,6 +685,83 @@ class DependencyScanner:
         
         return imports
     
+    def _resolve_wildcard_imports(self, module_name: str) -> List[str]:
+        """Attempt to resolve wildcard imports to specific symbols"""
+        try:
+            # Common modules and their public symbols
+            common_modules = {
+                'os': ['path', 'name', 'environ', 'getcwd', 'chdir', 'mkdir', 'rmdir', 'remove', 'rename', 'stat', 'listdir', 'walk', 'system', 'popen', 'kill', 'getpid', 'getppid', 'getuid', 'getgid', 'setuid', 'setgid', 'umask', 'chmod', 'chown', 'link', 'symlink', 'readlink', 'unlink', 'makedirs', 'removedirs', 'renames', 'stat_float_times', 'curdir', 'pardir', 'sep', 'extsep', 'altsep', 'pathsep', 'defpath', 'devnull', 'linesep'],
+                'sys': ['argv', 'path', 'modules', 'version', 'version_info', 'hexversion', 'platform', 'implementation', 'maxsize', 'maxunicode', 'exc_info', 'exc_type', 'exc_value', 'exc_traceback', 'last_type', 'last_value', 'last_traceback', 'stdin', 'stdout', 'stderr', 'stdin_fileno', 'stdout_fileno', 'stderr_fileno', 'getdefaultencoding', 'getfilesystemencoding', 'getrecursionlimit', 'setrecursionlimit', 'getrefcount', 'getsizeof', 'intern', 'exit', 'exitfunc', 'excepthook', 'displayhook', 'getprofile', 'setprofile', 'gettrace', 'settrace', 'getcheckinterval', 'setcheckinterval', 'getswitchinterval', 'setswitchinterval', 'getdlopenflags', 'setdlopenflags', 'getwindowsversion', 'get_asyncgen_hooks', 'set_asyncgen_hooks', 'get_coroutine_origin_tracking_depth', 'set_coroutine_origin_tracking_depth'],
+                'math': ['pi', 'e', 'tau', 'inf', 'nan', 'ceil', 'copysign', 'fabs', 'factorial', 'floor', 'fmod', 'frexp', 'fsum', 'gcd', 'isclose', 'isfinite', 'isinf', 'isnan', 'ldexp', 'modf', 'trunc', 'exp', 'expm1', 'log', 'log1p', 'log2', 'log10', 'pow', 'sqrt', 'acos', 'asin', 'atan', 'atan2', 'cos', 'dist', 'hypot', 'sin', 'tan', 'acosh', 'asinh', 'atanh', 'cosh', 'sinh', 'tanh', 'erf', 'erfc', 'gamma', 'lgamma'],
+                'json': ['dump', 'dumps', 'load', 'loads', 'JSONEncoder', 'JSONDecoder'],
+                're': ['match', 'search', 'findall', 'finditer', 'sub', 'subn', 'split', 'escape', 'purge', 'compile', 'template', 'error', 'A', 'I', 'L', 'M', 'S', 'X', 'U', 'ASCII', 'IGNORECASE', 'LOCALE', 'MULTILINE', 'DOTALL', 'VERBOSE', 'UNICODE', 'DEBUG'],
+                'datetime': ['date', 'datetime', 'time', 'timedelta', 'timezone', 'tzinfo', 'MINYEAR', 'MAXYEAR'],
+                'collections': ['deque', 'defaultdict', 'namedtuple', 'Counter', 'OrderedDict', 'ChainMap', 'UserDict', 'UserList', 'UserString'],
+                'itertools': ['count', 'cycle', 'repeat', 'accumulate', 'chain', 'chain.from_iterable', 'compress', 'dropwhile', 'filterfalse', 'groupby', 'islice', 'starmap', 'takewhile', 'tee', 'zip_longest', 'product', 'permutations', 'combinations', 'combinations_with_replacement'],
+                'pathlib': ['Path', 'PurePath', 'PurePosixPath', 'PureWindowsPath', 'PosixPath', 'WindowsPath'],
+                'typing': ['Any', 'Callable', 'Dict', 'List', 'Optional', 'Tuple', 'Union', 'TypeVar', 'Generic', 'Protocol', 'runtime_checkable', 'NoReturn', 'Literal', 'TypedDict', 'Final', 'Annotated', 'get_type_hints', 'cast', 'overload', 'Type', 'Text', 'AbstractSet', 'ByteString', 'Collection', 'Container', 'ItemsView', 'Iterable', 'Iterator', 'KeysView', 'Mapping', 'MappingView', 'MutableMapping', 'MutableSequence', 'MutableSet', 'Sequence', 'Set', 'ValuesView', 'Awaitable', 'AsyncIterator', 'AsyncIterable', 'Coroutine', 'Generator', 'AsyncGenerator', 'Reversible', 'SupportsAbs', 'SupportsBytes', 'SupportsComplex', 'SupportsFloat', 'SupportsIndex', 'SupportsInt', 'SupportsRound', 'ChainMap', 'Counter', 'Deque', 'Dict', 'DefaultDict', 'List', 'Set', 'FrozenSet', 'NamedTuple', 'TypedDict', 'Union', 'Optional', 'Literal', 'Final', 'Annotated', 'TypeVar', 'Generic', 'Protocol', 'runtime_checkable', 'NoReturn', 'get_type_hints', 'cast', 'overload', 'Type', 'Text', 'AbstractSet', 'ByteString', 'Collection', 'Container', 'ItemsView', 'Iterable', 'Iterator', 'KeysView', 'Mapping', 'MappingView', 'MutableMapping', 'MutableSequence', 'MutableSet', 'Sequence', 'Set', 'ValuesView', 'Awaitable', 'AsyncIterator', 'AsyncIterable', 'Coroutine', 'Generator', 'AsyncGenerator', 'Reversible', 'SupportsAbs', 'SupportsBytes', 'SupportsComplex', 'SupportsFloat', 'SupportsIndex', 'SupportsInt', 'SupportsRound']
+            }
+            
+            if module_name in common_modules:
+                return common_modules[module_name]
+            
+            # Try to import the module and get its __all__ attribute
+            try:
+                import importlib
+                module = importlib.import_module(module_name)
+                
+                if hasattr(module, '__all__'):
+                    return list(module.__all__)
+                else:
+                    # Get all public attributes (not starting with _)
+                    return [attr for attr in dir(module) if not attr.startswith('_')]
+                    
+            except (ImportError, AttributeError):
+                # If we can't import the module, return empty list
+                return []
+                
+        except Exception as e:
+            console.print(f"⚠️ Failed to resolve wildcard imports for {module_name}: {e}", style="yellow")
+            return []
+    
+    def _detect_dynamic_imports(self, content: str) -> List[ImportInfo]:
+        """Detect dynamic imports using regex patterns"""
+        dynamic_imports = []
+        
+        # Pattern for importlib.import_module
+        importlib_pattern = r'importlib\.import_module\([\'"]([^\'"]+)[\'"]'
+        for match in re.finditer(importlib_pattern, content):
+            module = match.group(1)
+            dynamic_imports.append(ImportInfo(
+                module=module,
+                import_type="dynamic_import",
+                line_number=0,  # Can't determine line number easily
+                dynamic_import=True
+            ))
+        
+        # Pattern for __import__
+        dunder_import_pattern = r'__import__\([\'"]([^\'"]+)[\'"]'
+        for match in re.finditer(dunder_import_pattern, content):
+            module = match.group(1)
+            dynamic_imports.append(ImportInfo(
+                module=module,
+                import_type="dynamic_import",
+                line_number=0,
+                dynamic_import=True
+            ))
+        
+        # Pattern for exec/eval with imports
+        exec_import_pattern = r'(?:exec|eval)\s*\([\'"](?:import|from).*?[\'"]'
+        if re.search(exec_import_pattern, content):
+            dynamic_imports.append(ImportInfo(
+                module="unknown",
+                import_type="exec_import",
+                line_number=0,
+                dynamic_import=True
+            ))
+        
+        return dynamic_imports
+    
     def _create_dependency_relationships(self, file_id: str, imports: List[ImportInfo], repo_id: str):
         """Create dependency relationships in Neo4j"""
         try:
@@ -728,6 +837,38 @@ class DependencyScanner:
                                                  full_name=full_name,
                                                  line=import_info.line_number,
                                                  alias=import_info.alias)
+                            
+                            elif import_info.import_type == "wildcard_import":
+                                session.run("""
+                                    MATCH (f:File {path: $file_id})
+                                    MATCH (m:Module {name: $module_name})
+                                    MERGE (f)-[r:WILDCARD_IMPORTS]->(m)
+                                    SET r.line = $line,
+                                        r.wildcard_import = true
+                                """, file_id=file_id,
+                                     module_name=import_info.module,
+                                     line=import_info.line_number)
+                            
+                            elif import_info.import_type == "dynamic_import":
+                                session.run("""
+                                    MATCH (f:File {path: $file_id})
+                                    MATCH (m:Module {name: $module_name})
+                                    MERGE (f)-[r:DYNAMIC_IMPORTS]->(m)
+                                    SET r.line = $line,
+                                        r.dynamic_import = true
+                                """, file_id=file_id,
+                                     module_name=import_info.module,
+                                     line=import_info.line_number)
+                            
+                            elif import_info.import_type == "exec_import":
+                                session.run("""
+                                    MATCH (f:File {path: $file_id})
+                                    MERGE (m:Module {name: 'unknown'})
+                                    MERGE (f)-[r:EXEC_IMPORTS]->(m)
+                                    SET r.line = $line,
+                                        r.exec_import = true
+                                """, file_id=file_id,
+                                     line=import_info.line_number)
                             
                             else:  # relative imports, namespace imports, etc.
                                 session.run("""
@@ -867,7 +1008,7 @@ class DependencyScanner:
         return packages
     
     def _create_package_relationships(self, packages: List[Dict[str, str]], repo_id: str):
-        """Create package nodes and relationships in Neo4j"""
+        """Create package nodes and relationships in Neo4j with deep dependency resolution"""
         try:
             with self.driver.session() as session:
                 for package in packages:
@@ -891,10 +1032,121 @@ class DependencyScanner:
                     """, repo_id=repo_id,
                          name=package["name"],
                          source_file=package.get("source_file"))
+                    
+                    # Resolve and create transitive dependencies
+                    transitive_deps = self._resolve_deep_dependencies(package["name"])
+                    for dep_name in transitive_deps:
+                        if dep_name != package["name"]:  # Don't create self-reference
+                            # Create transitive package node
+                            session.run("""
+                                MERGE (tp:Package {name: $name})
+                                SET tp.type = 'transitive_dependency',
+                                    tp.last_seen = datetime()
+                            """, name=dep_name)
+                            
+                            # Create transitive dependency relationship
+                            session.run("""
+                                MATCH (p:Package {name: $package_name})
+                                MATCH (tp:Package {name: $dep_name})
+                                MERGE (p)-[rel:TRANSITIVE_DEPENDS_ON]->(tp)
+                                SET rel.added_at = datetime()
+                            """, package_name=package["name"], dep_name=dep_name)
                 
         except Exception as e:
             console.print(f"❌ Failed to create package relationships: {e}", style="red")
             raise
+    
+    def _resolve_deep_dependencies(self, package_name: str) -> Set[str]:
+        """Resolve all transitive dependencies for a package"""
+        try:
+            # Try to use pkg_resources for Python packages
+            try:
+                import pkg_resources
+                dist = pkg_resources.get_distribution(package_name)
+                if dist:
+                    requires = dist.requires() if dist else []
+                    all_deps = {package_name}
+                    
+                    for req in requires:
+                        dep_name = req.name
+                        all_deps.add(dep_name)
+                        # Recursively resolve dependencies (with depth limit)
+                        all_deps.update(self._resolve_deep_dependencies_limited(dep_name, depth=2))
+                    
+                    return all_deps
+                    
+            except (pkg_resources.DistributionNotFound, ImportError):
+                pass
+            
+            # Fallback: try to import and inspect
+            try:
+                import importlib
+                module = importlib.import_module(package_name)
+                return self._analyze_module_imports(module)
+            except (ImportError, AttributeError):
+                pass
+            
+            # If all else fails, return just the package itself
+            return {package_name}
+                
+        except Exception as e:
+            console.print(f"⚠️ Failed to resolve deep dependencies for {package_name}: {e}", style="yellow")
+            return {package_name}
+    
+    def _resolve_deep_dependencies_limited(self, package_name: str, depth: int) -> Set[str]:
+        """Resolve dependencies with depth limit to prevent infinite recursion"""
+        if depth <= 0:
+            return set()
+        
+        try:
+            import pkg_resources
+            dist = pkg_resources.get_distribution(package_name)
+            if dist:
+                requires = dist.requires() if dist else []
+                deps = set()
+                
+                for req in requires:
+                    dep_name = req.name
+                    deps.add(dep_name)
+                    # Recursively resolve with reduced depth
+                    deps.update(self._resolve_deep_dependencies_limited(dep_name, depth - 1))
+                
+                return deps
+                
+        except (pkg_resources.DistributionNotFound, ImportError):
+            pass
+        
+        return set()
+    
+    def _analyze_module_imports(self, module) -> Set[str]:
+        """Analyze a module for its imports"""
+        try:
+            import inspect
+            import ast
+            
+            # Get module source if available
+            try:
+                source = inspect.getsource(module)
+                tree = ast.parse(source)
+                
+                imports = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            imports.add(alias.name.split('.')[0])  # Get top-level package
+                    elif isinstance(node, ast.ImportFrom):
+                        if node.module:
+                            imports.add(node.module.split('.')[0])
+                
+                return imports
+                
+            except (OSError, TypeError):
+                # Can't get source, try to analyze module attributes
+                return set()
+                
+        except Exception as e:
+            console.print(f"⚠️ Failed to analyze module imports: {e}", style="yellow")
+            return set()
     
     def _build_dependency_graph(self, repo_id: str) -> Dict[str, int]:
         """Build and analyze the dependency graph"""
